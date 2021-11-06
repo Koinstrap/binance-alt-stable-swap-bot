@@ -170,65 +170,6 @@ def get_currency_balance(client, currency_symbol):
             return float(currency_balance[u'free'])
     return None
 
-
-@retry(20)
-def buy_alt(client, alt_symbol, crypto_symbol):
-    '''
-    Buy altcoin
-    '''
-    ticks = {}
-    for filt in client.get_symbol_info(alt_symbol + crypto_symbol)['filters']:
-        if filt['filterType'] == 'LOT_SIZE':
-            ticks[alt_symbol] = filt['stepSize'].find('1') - 2
-            break
-
-    order_quantity = ((math.floor(get_currency_balance(client, crypto_symbol) *
-                                  10**ticks[alt_symbol] / get_market_ticker_price(client, alt_symbol+crypto_symbol))/float(10**ticks[alt_symbol])))
-    logger.info('BUY QTY {0}'.format(order_quantity))
-
-    # Try to buy until successful
-    order = None
-    while order is None:
-        try:
-            order = client.order_limit_buy(
-                symbol=alt_symbol + crypto_symbol,
-                quantity=order_quantity,
-                price=get_market_ticker_price(client, alt_symbol+crypto_symbol)
-            )
-            logger.info(order)
-        except BinanceAPIException as e:
-            logger.info(e)
-            time.sleep(1)
-        except Exception as e:
-            logger.info("Unexpected Error: {0}".format(e))
-
-    order_recorded = False
-    while not order_recorded:
-        try:
-            time.sleep(3)
-            stat = client.get_order(symbol=alt_symbol + crypto_symbol, orderId=order[u'orderId'])
-            order_recorded = True
-        except BinanceAPIException as e:
-            logger.info(e)
-            time.sleep(10)
-        except Exception as e:
-            logger.info("Unexpected Error: {0}".format(e))
-    while stat[u'status'] != 'FILLED':
-        try:
-            stat = client.get_order(
-                symbol=alt_symbol+crypto_symbol, orderId=order[u'orderId'])
-            time.sleep(1)
-        except BinanceAPIException as e:
-            logger.info(e)
-            time.sleep(2)
-        except Exception as e:
-            logger.info("Unexpected Error: {0}".format(e))
-
-    logger.info('Bought {0}'.format(alt_symbol))
-
-    return order
-
-
 @retry(20)
 def sell_alt(client, alt_symbol, crypto_symbol):
     '''
