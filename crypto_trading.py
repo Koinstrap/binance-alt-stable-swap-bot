@@ -11,6 +11,7 @@ from logging import Handler, Formatter
 import datetime
 import requests
 import random
+from tinydb import TinyDB, Query
 
 # Config consts
 CFG_FL_NAME = 'user.cfg'
@@ -79,6 +80,7 @@ if TELEGRAM_TOKEN:
 logger.info('Started')
 
 supported_coin_list = []
+stable_coins = ["USDT", "BUSD"]
 
 # Get supported coin list from supported_coin_list file
 with open('supported_coin_list') as f:
@@ -91,48 +93,9 @@ if not os.path.exists(CFG_FL_NAME):
     exit()
 config.read(CFG_FL_NAME)
 
-class CryptoState():
-    _coin_backup_file = ".current_coin"
-    _table_backup_file = ".current_coin_table"
+db = TinyDB('db.json')
 
-    def __init__(self):
-        if(os.path.isfile(self._coin_backup_file) and os.path.isfile(self._table_backup_file)):
-            with open(self._coin_backup_file, "r") as backup_file:
-                coin = backup_file.read()
-            with open(self._table_backup_file, "r") as backup_file:
-                coin_table = json.load(backup_file)
-            self.current_coin = coin
-            self.coin_table = coin_table
-        else:
-
-            current_coin = config.get(USER_CFG_SECTION, 'current_coin')
-
-            if not current_coin:
-
-                current_coin = random.choice(supported_coin_list)
-
-            logger.info("Setting initial coin to {0}".format(current_coin))
-
-            if (not current_coin in supported_coin_list):
-                exit(
-                    "***\nERROR!\nSince there is no backup file, a proper coin name must be provided at init\n***")
-            self.current_coin = current_coin
-            with open(self._coin_backup_file, "w") as backup_file:
-                backup_file.write(self.current_coin)
-            # Dictionary of coin dictionaries.
-            # Designated to keep track of the selling point for each coin with respect to all other coins.
-            self.coin_table = dict((coin_entry, dict((coin, 0) for coin in supported_coin_list if coin != coin_entry))
-                                   for coin_entry in supported_coin_list)
-
-    def __setattr__(self, name, value):
-        if name == "current_coin":
-            with open(self._coin_backup_file, "w") as backup_file:
-                backup_file.write(value)
-        self.__dict__[name] = value
-        return
-
-g_state = CryptoState()
-
+transactions = db.table('transactions_traded')
 
 def retry(howmany):
     def tryIt(func):
@@ -234,72 +197,41 @@ def sell_alt(client, alt_symbol, crypto_symbol):
 
     return order
 
-
-def transaction_through_tether(client, source_coin, dest_coin):
+def get_24_hours_deposit_history_for_all_coins(client):
     '''
-    Jump from the source coin to the destination coin through tether
+    Get deposit history for all coins
     '''
-    result = None
-    while result is None:
-        result = sell_alt(client, source_coin, 'USDT')
-    result = None
-    while result is None:
-        result = buy_alt(client, dest_coin, 'USDT')
-    global g_state
-    g_state.current_coin = dest_coin
-    update_trade_threshold(client)
 
+    deposit_history = client.get_deposit_history(status = 1, startTime = int(time.time() - 86400 * 60) * 1000, endTime = int(time.time()) * 1000)
 
-def update_trade_threshold(client):
-    '''
-    Update all the coins with the threshold of buying the current held coin
-    '''
-    global g_state
-    current_coin_price = float(get_market_ticker_price(
-        client,  g_state.current_coin + 'USDT'))
-    for coin_dict in g_state.coin_table.copy():
-        g_state.coin_table[coin_dict][g_state.current_coin] = float(get_market_ticker_price(
-            client, coin_dict + 'USDT'))/current_coin_price
-    with open(g_state._table_backup_file, "w") as backup_file:
-        json.dump(g_state.coin_table, backup_file)
+    filtered_deposit_history = []
 
+    for deposit in deposit_history:
+        if deposit['insertTime'] <= ((time.time() * 86400)):
+            filtered_deposit_history.append(deposit)
 
-def initialize_trade_thresholds(client):
-    '''
-    Initialize the buying threshold of all the coins for trading between them
-    '''
-    global g_state
-    for coin_dict in g_state.coin_table.copy():
-        coin_dict_price = float(get_market_ticker_price(client, coin_dict + 'USDT'))
-        for coin in supported_coin_list:
-            logger.info("Initializing {0} vs {1}".format(coin_dict, coin))
-            if coin != coin_dict:
-                coin_price = float(get_market_ticker_price(client, coin + 'USDT'))
-                g_state.coin_table[coin_dict][coin] = coin_dict_price / coin_price
-
-    logger.info("Done initializing, generating file")
-    with open(g_state._table_backup_file, "w") as backup_file:
-        json.dump(g_state.coin_table, backup_file)
+    return filtered_deposit_history
 
 
 def scout(client, transaction_fee=0.001, multiplier=5):
     '''
-    Scout for potential jumps from the current coin to another coin
+        Get deposit history
+        Filter only transaction after 24 hours
     '''
-    global g_state
-    curr_coin_price = float(get_market_ticker_price(
-        client, g_state.current_coin + 'USDT'))
-    for optional_coin in [coin for coin in g_state.coin_table[g_state.current_coin].copy() if coin != g_state.current_coin]:
-        # Obtain (current coin)/(optional coin)
-        coin_opt_coin_ratio = curr_coin_price / \
-            float(get_market_ticker_price(client, optional_coin + 'USDT'))
 
-        if (coin_opt_coin_ratio - transaction_fee * multiplier * coin_opt_coin_ratio) > g_state.coin_table[g_state.current_coin][optional_coin]:
-            logger.info('Will be jumping from {0} to {1}'.format(
-                g_state.current_coin, optional_coin))
-            transaction_through_tether(
-                client, g_state.current_coin, optional_coin)
-            break
+    filtered_deposit_history = get_24_hours_deposit_history_for_all_coins(client)
+    wallets_balance = client.get_account()[u'balances']
+
+    '''
+        Trade all deposit if value is available in balance
+    '''
+    
+    for deposit in filtered_deposit_history:
+        for balance in wallets_balance:
+            if balance['asset'] == deposit['coin'] and float(balance['free']) >= float(deposit['amount']) and deposit['coin'] not in stable_coins:
+                logger.info('Found {0} in balance'.format(deposit['coin']))
+                # sell_alt(client, deposit['coin'], 'USDT')
+                break
 
 
 def main():
@@ -307,14 +239,6 @@ def main():
     api_secret_key = config.get(USER_CFG_SECTION, 'api_secret_key')
 
     client = Client(api_key, api_secret_key)
-
-    global g_state
-    if not (os.path.isfile(g_state._table_backup_file)):
-        initialize_trade_thresholds(client)
-        if config.get(USER_CFG_SECTION, 'current_coin') == '':
-            logger.info("Purchasing {0} to begin trading".format(g_state.current_coin))
-            buy_alt(client, g_state.current_coin, "USDT")
-            logger.info("Ready to start trading")
 
     while True:
         try:
